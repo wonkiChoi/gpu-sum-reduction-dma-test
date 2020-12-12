@@ -1,5 +1,5 @@
 #include "reduce.h"
-
+#include <stdio.h>
 #include <cmath>
 
 #include "cuda_runtime.h"
@@ -13,8 +13,59 @@
 // Main strategies used:
 // - Process as much data as possible (in terms of algorithm correctness) in shared memory
 // - Use sequential addressing to get rid of bank conflicts
+__device__
+int sint4korr(const char *record_ptr) {
+  int result;
+  char *result_ptr = (char *) &result;
+  for (unsigned long i = 0; i < sizeof(int); ++i) {
+    result_ptr[i] = record_ptr[i];
+  }
+  return result;
+}
+
 __global__
 void block_sum_reduce(unsigned int* const d_block_sums, 
+	const unsigned int* const d_in,
+	const unsigned int d_in_len)
+{
+	extern __shared__ unsigned int s_out[];
+
+	unsigned int max_elems_per_block = blockDim.x * 2;
+	unsigned int glbl_tid = blockDim.x * blockIdx.x + threadIdx.x;
+	unsigned int tid = threadIdx.x;
+	
+	// Zero out shared memory
+	// Especially important when padding shmem for
+	//  non-power of 2 sized input
+	s_out[threadIdx.x] = 0;
+	s_out[threadIdx.x + blockDim.x] = 0;
+
+	__syncthreads();
+
+	// Copy d_in to shared memory per block
+	if (glbl_tid < d_in_len)
+	{
+		s_out[threadIdx.x] = d_in[glbl_tid];
+		if (glbl_tid + blockDim.x < d_in_len)
+			s_out[threadIdx.x + blockDim.x] = d_in[glbl_tid + blockDim.x];
+	}
+	__syncthreads();
+
+	// Actually do the reduction
+	for (unsigned int s = blockDim.x; s > 0; s >>= 1) {
+		if (tid < s) {
+			s_out[tid] += s_out[tid + s];
+		}
+		__syncthreads();
+	}
+
+	// write result for this block to global mem
+	if (tid == 0)
+		d_block_sums[blockIdx.x] = s_out[0];
+}
+
+__global__
+void block_sum_reduce_dma(unsigned int* const d_block_sums, 
 	const unsigned int* const d_in,
 	const unsigned int d_in_len)
 {
@@ -261,9 +312,8 @@ void print_d_array(unsigned int* d_array, unsigned int len)
 	checkCudaErrors(cudaMemcpy(h_array, d_array, sizeof(unsigned int) * len, cudaMemcpyDeviceToHost));
 	for (unsigned int i = 0; i < len; ++i)
 	{
-		std::cout << h_array[i] << " ";
+		std::cout << i << " : " <<h_array[i] << std::endl;
 	}
-	std::cout << std::endl;
 
 	delete[] h_array;
 }
@@ -324,6 +374,69 @@ unsigned int gpu_sum_reduce(unsigned int* d_in, unsigned int d_in_len)
 		checkCudaErrors(cudaMalloc(&d_in_block_sums, sizeof(unsigned int) * grid_sz));
 		checkCudaErrors(cudaMemcpy(d_in_block_sums, d_block_sums, sizeof(unsigned int) * grid_sz, cudaMemcpyDeviceToDevice));
 		total_sum = gpu_sum_reduce(d_in_block_sums, grid_sz);
+		checkCudaErrors(cudaFree(d_in_block_sums));
+	}
+
+	checkCudaErrors(cudaFree(d_block_sums));
+	return total_sum;
+}
+
+unsigned int gpu_sum_reduce_dma(unsigned int* d_in, unsigned int d_in_len)
+{
+	unsigned int total_sum = 0;
+
+	// Set up number of threads and blocks
+	// If input size is not power of two, the remainder will still need a whole block
+	// Thus, number of blocks must be the least number of 2048-blocks greater than the input size
+	unsigned int block_sz = MAX_BLOCK_SZ; // Halve the block size due to reduce3() and further 
+											  //  optimizations from there
+	// our block_sum_reduce()
+	unsigned int max_elems_per_block = block_sz * 2; // due to binary tree nature of algorithm
+	// NVIDIA's reduceX()
+	//unsigned int max_elems_per_block = block_sz;
+	
+	unsigned int grid_sz = 0;
+	if (d_in_len <= max_elems_per_block)
+	{
+		grid_sz = (unsigned int)std::ceil(float(d_in_len) / float(max_elems_per_block));
+	}
+	else
+	{
+		grid_sz = d_in_len / max_elems_per_block;
+		if (d_in_len % max_elems_per_block != 0)
+			grid_sz++;
+	}
+
+	// Allocate memory for array of total sums produced by each block
+	// Array length must be the same as number of blocks / grid size
+	unsigned int* d_block_sums;
+	checkCudaErrors(cudaMalloc(&d_block_sums, sizeof(unsigned int) * grid_sz));
+	checkCudaErrors(cudaMemset(d_block_sums, 0, sizeof(unsigned int) * grid_sz));
+
+	// Sum data allocated for each block
+	block_sum_reduce_dma<<<grid_sz, block_sz, sizeof(unsigned int) * max_elems_per_block>>>(d_block_sums, d_in, d_in_len);
+	//reduce4<<<grid_sz, block_sz, sizeof(unsigned int) * block_sz>>>(d_block_sums, d_in, d_in_len);
+	//print_d_array(d_block_sums, grid_sz);
+
+	// Sum each block's total sums (to get global total sum)
+	// Use basic implementation if number of total sums is <= 2048
+	// Else, recurse on this same function
+	if (grid_sz <= max_elems_per_block)
+	{
+		unsigned int* d_total_sum;
+		checkCudaErrors(cudaMalloc(&d_total_sum, sizeof(unsigned int)));
+		checkCudaErrors(cudaMemset(d_total_sum, 0, sizeof(unsigned int)));
+		block_sum_reduce_dma<<<1, block_sz, sizeof(unsigned int) * max_elems_per_block>>>(d_total_sum, d_block_sums, grid_sz);
+		//reduce4<<<1, block_sz, sizeof(unsigned int) * block_sz>>>(d_total_sum, d_block_sums, grid_sz);
+		checkCudaErrors(cudaMemcpy(&total_sum, d_total_sum, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+		checkCudaErrors(cudaFree(d_total_sum));
+	}
+	else
+	{
+		unsigned int* d_in_block_sums;
+		checkCudaErrors(cudaMalloc(&d_in_block_sums, sizeof(unsigned int) * grid_sz));
+		checkCudaErrors(cudaMemcpy(d_in_block_sums, d_block_sums, sizeof(unsigned int) * grid_sz, cudaMemcpyDeviceToDevice));
+		total_sum = gpu_sum_reduce_dma(d_in_block_sums, grid_sz);
 		checkCudaErrors(cudaFree(d_in_block_sums));
 	}
 
